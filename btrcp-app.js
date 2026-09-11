@@ -1087,3 +1087,426 @@ window.onload = function() {
     buildCompanyDocFields();
     initApp();
 };
+
+// ============ OPTIONAL EXPRESS API BRIDGE ============
+// The prototype remains usable from file:// and when the API is offline. When
+// served by server.js, authentication and registry mutations use the SQLite API.
+const BTRCP_API_TOKEN_KEY = 'btrcp_api_token';
+let btrcpApiMode = false;
+const legacyHandlers = {
+    handleLogin, handleRegister, handlePasswordRecovery, handlePasswordChange,
+    handleCreateAdmin, setCompanySuspension, activateLicense, handleNewDevice,
+    handleCompanyDevice, handleLinkDevice, unlinkDevice, updateAdminRole, handleNewBusiness,
+    flagDevice, runPublicVerification, logout
+};
+
+function apiNetworkError(error) {
+    return error && (error.name === 'TypeError' || error.code === 'NETWORK_ERROR');
+}
+
+async function btrcpApi(path, options = {}) {
+    const headers = { ...(options.headers || {}) };
+    if (options.body && typeof options.body !== 'string') {
+        headers['Content-Type'] = 'application/json';
+        options.body = JSON.stringify(options.body);
+    }
+    const token = localStorage.getItem(BTRCP_API_TOKEN_KEY);
+    if (token) headers.Authorization = 'Bearer ' + token;
+    let response;
+    try {
+        response = await fetch('/api' + path, { ...options, headers });
+    } catch (error) {
+        error.code = 'NETWORK_ERROR';
+        throw error;
+    }
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        const error = new Error(data.error || 'The server rejected the request.');
+        error.status = response.status;
+        throw error;
+    }
+    return data;
+}
+
+function applyApiState(data) {
+    if (!data) return;
+    if (data.accounts) accounts = data.accounts;
+    if (data.licenses) licenses = data.licenses;
+    if (data.devices) devices = data.devices;
+    if (data.businesses) businesses = data.businesses;
+    if (data.complaints) complaints = data.complaints;
+    if (data.transfers) transfers = data.transfers;
+    if (data.transactions) transactions = data.transactions;
+    if (data.user) {
+        currentUser = data.user;
+        session = { id: data.user.id, ts: Date.now() };
+        saveStore(STORE_KEYS.session, session);
+    }
+}
+
+async function refreshApiState() {
+    const data = await btrcpApi('/bootstrap');
+    applyApiState(data);
+    renderAll();
+    if (currentUser) {
+        if (currentUser.type === 'company') renderCompanyPortal();
+        if (currentUser.type === 'customer') renderCustomerPortal();
+    }
+    return data;
+}
+
+function showApiError(error, fallbackMessage) {
+    return error && error.message ? error.message : fallbackMessage;
+}
+
+window.logout = function() {
+    if (btrcpApiMode) localStorage.removeItem(BTRCP_API_TOKEN_KEY);
+    return legacyHandlers.logout();
+};
+
+window.handleLogin = async function(e) {
+    e.preventDefault();
+    if (!btrcpApiMode) return legacyHandlers.handleLogin(e);
+    const errBox = document.getElementById('loginError');
+    errBox.classList.add('hidden');
+    try {
+        const data = await btrcpApi('/auth/login', {
+            method: 'POST',
+            body: {
+                email: document.getElementById('login-email').value.trim().toLowerCase(),
+                password: document.getElementById('login-password').value
+            }
+        });
+        localStorage.setItem(BTRCP_API_TOKEN_KEY, data.token);
+        await refreshApiState();
+        initApp();
+    } catch (error) {
+        if (apiNetworkError(error)) return legacyHandlers.handleLogin(e);
+        errBox.textContent = showApiError(error, 'Unable to sign in.');
+        errBox.classList.remove('hidden');
+    }
+};
+
+window.handleRegister = async function(e) {
+    e.preventDefault();
+    if (!btrcpApiMode) return legacyHandlers.handleRegister(e);
+    const errBox = document.getElementById('regError');
+    errBox.classList.add('hidden');
+    const type = document.querySelector('input[name="reg-type"]:checked').value;
+    const payload = {
+        type,
+        nin: document.getElementById('reg-nin').value.trim(),
+        name: document.getElementById('reg-name').value.trim(),
+        email: document.getElementById('reg-email').value.trim().toLowerCase(),
+        phone: document.getElementById('reg-phone').value.trim(),
+        password: document.getElementById('reg-password').value,
+        lga: type === 'company' ? document.getElementById('reg-lga').value : 'Makurdi',
+        cac: type === 'company' ? document.getElementById('reg-cac').value.trim() : '',
+        representativeName: type === 'company' ? document.getElementById('reg-rep-name').value.trim() : '',
+        documents: type === 'company' ? { ...uploadedDocs } : {}
+    };
+    if (payload.password !== document.getElementById('reg-password2').value) {
+        errBox.textContent = 'Passwords do not match.';
+        errBox.classList.remove('hidden');
+        return;
+    }
+    try {
+        const data = await btrcpApi('/auth/register', { method: 'POST', body: payload });
+        localStorage.setItem(BTRCP_API_TOKEN_KEY, data.token);
+        await refreshApiState();
+        Object.keys(uploadedDocs).forEach(key => delete uploadedDocs[key]);
+        initApp();
+    } catch (error) {
+        if (apiNetworkError(error)) return legacyHandlers.handleRegister(e);
+        errBox.textContent = showApiError(error, 'Unable to create account.');
+        errBox.classList.remove('hidden');
+    }
+};
+
+window.handlePasswordRecovery = async function(e) {
+    e.preventDefault();
+    if (!btrcpApiMode) return legacyHandlers.handlePasswordRecovery(e);
+    try {
+        await btrcpApi('/auth/recover', {
+            method: 'POST',
+            body: {
+                email: document.getElementById('recovery-email').value.trim().toLowerCase(),
+                phone: document.getElementById('recovery-phone').value.trim(),
+                newPassword: document.getElementById('recovery-new-password').value
+            }
+        });
+        showResult('recoveryResult', 'Password reset successfully. You can now sign in.', true);
+    } catch (error) {
+        if (apiNetworkError(error)) return legacyHandlers.handlePasswordRecovery(e);
+        showResult('recoveryResult', showApiError(error, 'Password recovery failed.'), false);
+    }
+};
+
+window.handlePasswordChange = async function(e) {
+    e.preventDefault();
+    if (!btrcpApiMode) return legacyHandlers.handlePasswordChange(e);
+    const nextPassword = document.getElementById('settings-new-password').value;
+    if (nextPassword !== document.getElementById('settings-confirm-password').value) {
+        return showResult('settingsResult', 'New passwords do not match.', false);
+    }
+    try {
+        await btrcpApi('/auth/change-password', {
+            method: 'POST',
+            body: {
+                currentPassword: document.getElementById('settings-current-password').value,
+                newPassword: nextPassword
+            }
+        });
+        ['settings-current-password', 'settings-new-password', 'settings-confirm-password'].forEach(id => { document.getElementById(id).value = ''; });
+        showResult('settingsResult', 'Password changed successfully.', true);
+    } catch (error) {
+        if (apiNetworkError(error)) return legacyHandlers.handlePasswordChange(e);
+        showResult('settingsResult', showApiError(error, 'Password change failed.'), false);
+    }
+};
+
+window.handleCreateAdmin = async function(e) {
+    e.preventDefault();
+    if (!btrcpApiMode) return legacyHandlers.handleCreateAdmin(e);
+    try {
+        await btrcpApi('/admin/accounts', {
+            method: 'POST',
+            body: {
+                name: document.getElementById('admin-name').value.trim(),
+                email: document.getElementById('admin-email').value.trim().toLowerCase(),
+                password: document.getElementById('admin-password').value,
+                role: document.getElementById('admin-role').value
+            }
+        });
+        e.target.reset();
+        await refreshApiState();
+        renderAdminAccounts();
+        alert('Admin account created successfully.');
+    } catch (error) {
+        if (apiNetworkError(error)) return legacyHandlers.handleCreateAdmin(e);
+        alert(showApiError(error, 'Unable to create admin account.'));
+    }
+};
+
+window.updateAdminRole = async function(id, role) {
+    if (!btrcpApiMode) return legacyHandlers.updateAdminRole(id, role);
+    try {
+        await btrcpApi('/admin/accounts/' + encodeURIComponent(id) + '/role', { method: 'PATCH', body: { role } });
+        await refreshApiState();
+        renderAdminAccounts();
+    } catch (error) {
+        if (apiNetworkError(error)) return legacyHandlers.updateAdminRole(id, role);
+        alert(showApiError(error, 'Unable to update administrator role.'));
+    }
+};
+
+window.setCompanySuspension = async function(companyId, suspended) {
+    if (!btrcpApiMode) return legacyHandlers.setCompanySuspension(companyId, suspended);
+    if (!currentUser || currentUser.type !== 'admin' || !['master_admin', 'license_renewal'].includes(currentUser.role)) {
+        alert('Only an authorized license administrator can change company enforcement status.');
+        return;
+    }
+    const reason = suspended ? prompt('Enter the violation reason:') : '';
+    if (suspended && !reason) return;
+    const license = licenses.find(item => item.companyId === companyId);
+    if (!license) return;
+    try {
+        await btrcpApi('/licenses/' + encodeURIComponent(license.id) + '/suspension', { method: 'PATCH', body: { suspended, reason } });
+        await refreshApiState();
+        renderLicenseManagement();
+        alert(suspended ? 'Company device registration and linking have been suspended.' : 'Company device operations have been restored.');
+    } catch (error) {
+        if (apiNetworkError(error)) return legacyHandlers.setCompanySuspension(companyId, suspended);
+        alert(showApiError(error, 'Unable to update company enforcement status.'));
+    }
+};
+
+window.activateLicense = async function(licenseId) {
+    if (!btrcpApiMode) return legacyHandlers.activateLicense(licenseId);
+    try {
+        await btrcpApi('/licenses/' + encodeURIComponent(licenseId) + '/activate', { method: 'PATCH' });
+        await refreshApiState();
+        renderLicenseManagement();
+        alert('License ' + licenseId + ' activated successfully.');
+    } catch (error) {
+        if (apiNetworkError(error)) return legacyHandlers.activateLicense(licenseId);
+        alert(showApiError(error, 'Unable to activate license.'));
+    }
+};
+
+window.handleNewBusiness = async function(e) {
+    e.preventDefault();
+    if (!btrcpApiMode) return legacyHandlers.handleNewBusiness(e);
+    try {
+        const data = await btrcpApi('/licenses', {
+            method: 'POST',
+            body: {
+                name: document.getElementById('form-biz-name').value.trim(),
+                category: document.getElementById('form-biz-cat').value,
+                lga: document.getElementById('form-biz-lga').value,
+                cac: document.getElementById('form-biz-cac').value.trim() || 'RC-PENDING'
+            }
+        });
+        await refreshApiState();
+        closeModal('newBusinessModal');
+        e.target.reset();
+        viewCertificate(data.license.id);
+    } catch (error) {
+        if (apiNetworkError(error)) return legacyHandlers.handleNewBusiness(e);
+        alert(showApiError(error, 'Unable to create license.'));
+    }
+};
+
+window.handleNewDevice = async function(e) {
+    e.preventDefault();
+    if (!btrcpApiMode) return legacyHandlers.handleNewDevice(e);
+    try {
+        const data = await btrcpApi('/devices', {
+            method: 'POST',
+            body: {
+                model: document.getElementById('form-dev-model').value.trim(),
+                category: document.getElementById('form-dev-cat').value,
+                imei: document.getElementById('form-dev-imei').value.trim(),
+                owner: document.getElementById('form-dev-owner').value.trim()
+            }
+        });
+        await refreshApiState();
+        closeModal('newDeviceModal');
+        e.target.reset();
+        alert(`Device Registered Successfully!\nUnique ID: ${data.device.id}\nIMEI Tagged: ${data.device.imei}\nFee Paid: ₦1,000`);
+    } catch (error) {
+        if (apiNetworkError(error)) return legacyHandlers.handleNewDevice(e);
+        alert(showApiError(error, 'Unable to register device.'));
+    }
+};
+
+window.handleCompanyDevice = async function(e) {
+    e.preventDefault();
+    if (!btrcpApiMode) return legacyHandlers.handleCompanyDevice(e);
+    try {
+        const data = await btrcpApi('/devices', {
+            method: 'POST',
+            body: {
+                model: document.getElementById('cmp-dev-model').value.trim(),
+                category: document.getElementById('cmp-dev-cat').value,
+                imei: document.getElementById('cmp-dev-imei').value.trim(),
+                idType: document.getElementById('cmp-dev-idtype').value,
+                condition: document.getElementById('cmp-dev-condition').value
+            }
+        });
+        await refreshApiState();
+        closeModal('companyDeviceModal');
+        e.target.reset();
+        alert(`Device ${data.device.id} registered successfully! Fee: ₦1,000. You can now link it to a customer.`);
+    } catch (error) {
+        if (apiNetworkError(error)) return legacyHandlers.handleCompanyDevice(e);
+        alert(showApiError(error, 'Unable to register device.'));
+    }
+};
+
+window.handleLinkDevice = async function(e) {
+    e.preventDefault();
+    if (!btrcpApiMode) return legacyHandlers.handleLinkDevice(e);
+    if (!verifiedLinkCustomer) return alert('Please search and verify a customer by NIN and Account ID first.');
+    try {
+        const deviceId = document.getElementById('link-device-select').value;
+        await btrcpApi('/devices/' + encodeURIComponent(deviceId) + '/link', {
+            method: 'PATCH',
+            body: {
+                customerId: verifiedLinkCustomer.id,
+                nin: verifiedLinkCustomer.nin,
+                purchaseDate: document.getElementById('link-purchase-date').value
+            }
+        });
+        await refreshApiState();
+        closeModal('linkDeviceModal');
+        alert('Device linked successfully.');
+    } catch (error) {
+        if (apiNetworkError(error)) return legacyHandlers.handleLinkDevice(e);
+        alert(showApiError(error, 'Unable to link device.'));
+    }
+};
+
+window.unlinkDevice = async function(deviceId) {
+    if (!btrcpApiMode) return legacyHandlers.unlinkDevice(deviceId);
+    if (!confirm('Unlink this device from the customer?')) return;
+    try {
+        await btrcpApi('/devices/' + encodeURIComponent(deviceId) + '/unlink', { method: 'PATCH' });
+        await refreshApiState();
+    } catch (error) {
+        if (apiNetworkError(error)) return legacyHandlers.unlinkDevice(deviceId);
+        alert(showApiError(error, 'Unable to unlink device.'));
+    }
+};
+
+window.flagDevice = async function(imei) {
+    if (!btrcpApiMode) return legacyHandlers.flagDevice(imei);
+    const device = devices.find(item => item.imei === imei);
+    if (!device) return;
+    try {
+        await btrcpApi('/devices/' + encodeURIComponent(device.id) + '/flag', { method: 'PATCH' });
+        await refreshApiState();
+        alert(`Device IMEI ${imei} has been flagged as STOLEN.`);
+    } catch (error) {
+        if (apiNetworkError(error)) return legacyHandlers.flagDevice(imei);
+        alert(showApiError(error, 'Unable to flag device.'));
+    }
+};
+
+window.runPublicVerification = async function() {
+    if (!btrcpApiMode) return legacyHandlers.runPublicVerification();
+    const query = document.getElementById('publicSearchQuery').value.trim();
+    const container = document.getElementById('publicVerificationResult');
+    if (!query) return;
+    try {
+        const data = await btrcpApi('/public/verify?q=' + encodeURIComponent(query));
+        const record = data.record;
+        const flagged = data.flagged;
+        container.className = flagged ? 'mt-6 text-left border rounded-xl p-4 bg-red-50 border-red-400 text-red-900 text-xs' : 'mt-6 text-left border rounded-xl p-4 bg-emerald-50 border-emerald-300 text-emerald-900 text-xs';
+        if (data.kind === 'device') {
+            container.innerHTML = `<div class="font-bold text-sm mb-2">DEVICE STATUS: ${record.status}</div><div>Model: <strong>${record.model}</strong></div><div>${record.idType}: <span class="font-mono">${record.imei}</span></div><div>Registered Vendor: ${record.owner}</div>`;
+        } else {
+            container.innerHTML = `<div class="font-bold text-sm mb-2">${flagged ? 'CERTIFICATE FLAGGED — COMPLIANCE ACTION REQUIRED' : 'VERIFIED LICENSED OPERATOR'}</div><div class="grid grid-cols-2 gap-2"><div><strong>Business Entity:</strong> ${record.companyName || record.name}</div><div><strong>License Code:</strong> ${record.id}</div><div><strong>LGA Location:</strong> ${record.lga}</div><div><strong>Status:</strong> ${record.flagReason || record.status || 'Active'}</div></div>`;
+        }
+        container.classList.remove('hidden');
+    } catch (error) {
+        if (apiNetworkError(error)) return legacyHandlers.runPublicVerification();
+        container.className = 'mt-6 text-left border rounded-xl p-4 bg-red-50 border-red-300 text-red-900 text-xs';
+        container.textContent = error.status === 404 ? 'NOT FOUND / UNLICENSED — No active record was found.' : showApiError(error, 'Verification failed.');
+        container.classList.remove('hidden');
+    }
+};
+
+window.onload = async function() {
+    populateLGAs();
+    buildCompanyDocFields();
+    if (location.protocol === 'http:' || location.protocol === 'https:') {
+        try {
+            const health = await fetch('/api/health');
+            if (!health.ok) throw new Error('API health check failed');
+            btrcpApiMode = true;
+            if (localStorage.getItem(BTRCP_API_TOKEN_KEY)) {
+                try {
+                    await refreshApiState();
+                    initApp();
+                } catch (error) {
+                    if (error.status === 401) {
+                        localStorage.removeItem(BTRCP_API_TOKEN_KEY);
+                        session = null;
+                        showAuth();
+                    } else {
+                        btrcpApiMode = false;
+                        initApp();
+                    }
+                }
+            } else {
+                session = null;
+                showAuth();
+            }
+            return;
+        } catch (_) {
+            btrcpApiMode = false;
+        }
+    }
+    initApp();
+};
